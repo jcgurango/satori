@@ -122,6 +122,37 @@ await satori(
 )
 ```
 
+#### Inline Elements
+
+`<span>`, `<b>`, `<strong>`, `<i>`, `<em>`, `<u>`, `<s>`, `<code>`, `<kbd>`, `<mark>`, `<big>`, and `<small>` participate in their parent's text flow rather than producing their own flex item. When every child of a parent is a text string or one of these elements, the children flatten into a single text run with per-segment styles, allowing mixed colors, fonts, and weights on the same line:
+
+```jsx
+await satori(
+  <div style={{ fontSize: 24 }}>
+    Hello <span style={{ color: 'red' }}>red</span> world,
+    {' '}<b>bold</b> here.
+  </div>,
+  options
+)
+```
+
+A parent whose children are all text or inline elements does not require `display: flex` — for example, `<div>foo <span>bar</span></div>` is accepted as-is. A parent that mixes inline children with a block child (e.g., a nested `<div>`) still requires `display: flex`, `display: contents`, or `display: none`.
+
+Supported per-span properties:
+
+- **Layout-affecting (text shaping)**: `color`, `fontFamily`, `fontWeight`, `fontStyle`, `fontSize`, `letterSpacing`. Each segment is measured with its own font, and line height grows to fit the tallest segment.
+- **Paint-only (visual decoration, no layout effect)**: `backgroundColor`, `border` (width + color), `padding`. These are rendered as rectangles around each line fragment of the span — a span that wraps across multiple lines emits one background/border rectangle per line.
+
+The paint-only treatment is a deliberate determinism tradeoff over full HTML compatibility: inline padding and border do not push surrounding text outward, so layout is solely determined by font metrics and content.
+
+Constraints:
+
+- `vertical-align` is not supported; mixed font sizes share a single baseline.
+- Per-side `border` widths and colors collapse to a single stroked rectangle per line fragment.
+- Per-span `text-decoration` and `text-shadow` are not honored (set them on the parent).
+- `background-clip: text` is not supported on inline spans.
+- Whitespace collapsing is performed within each segment's text and at segment boundaries; cross-segment behavior is intentionally simpler than CSS to keep output deterministic.
+
 ### CSS
 
 Satori uses the same Flexbox [layout engine](https://yogalayout.com) as React Native, and it’s **not** a complete CSS implementation. However, it supports a subset of the spec that covers most common CSS features:

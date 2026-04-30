@@ -1,7 +1,7 @@
 {
-  "name": "satori",
-  "version": "0.0.0-development.2",
-  "description": "Enlightened library to convert HTML and CSS to SVG.",
+  "name": "@jcgurango/satori",
+  "version": "0.27.0",
+  "description": "Fork of Vercel's Satori with real inline element support.",
   "module": "./dist/index.js",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -56,7 +56,6 @@
     }
   },
   "scripts": {
-    "prepare": "husky install",
     "dev": "pnpm run dev:default",
     "dev:default": "NODE_ENV=development tsup src/index.ts --watch --ignore-watch playground",
     "dev:playground": "turbo dev --filter=satori-playground...",
@@ -82,7 +81,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vercel/satori.git"
+    "url": "git+https://github.com/jcgurango/satori.git"
   },
   "keywords": [
     "HTML",
@@ -93,9 +92,9 @@
   ],
   "author": "Shu Ding <g@shud.in>",
   "bugs": {
-    "url": "https://github.com/vercel/satori/issues"
+    "url": "https://github.com/jcgurango/satori/issues"
   },
-  "homepage": "https://github.com/vercel/satori#readme",
+  "homepage": "https://github.com/jcgurango/satori#readme",
   "devDependencies": {
     "@resvg/resvg-js": "^2.1.0",
     "@types/node": "^16",

@@ -7,12 +7,15 @@ describe('Error', () => {
   let fonts
   initFonts((f) => (fonts = f))
 
-  it('should throw if flex missing on div that has children', async () => {
+  it('should throw if flex missing on div that has block children', async () => {
+    // Inline-only children (text + span) no longer require display:flex on
+    // their parent — they go through the inline text-flow path. A div with
+    // any block child (like a nested div) still requires explicit display.
     let error = new Error()
     try {
       await satori(
         <div>
-          Test <span>satori</span> with space
+          Text <div>nested block</div>
         </div>,
         {
           width: 10,
@@ -26,6 +29,20 @@ describe('Error', () => {
     expect(error?.message).toBe(
       'Expected <div> to have explicit "display: flex", "display: contents", or "display: none" if it has more than one child node.'
     )
+  })
+
+  it('should not throw if flex missing on div with text + inline children', async () => {
+    const svg = await satori(
+      <div>
+        Test <span>satori</span> with space
+      </div>,
+      {
+        width: 10,
+        height: 10,
+        fonts,
+      }
+    )
+    expect(typeof svg).toBe('string')
   })
 
   it('should throw if display inline-block on div that has children', async () => {

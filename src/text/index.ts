@@ -1,6 +1,12 @@
 /**
- * This module calculates the layout of a text string. Currently the only
- * supported inline node is text. All other nodes are using block layout.
+ * This module calculates the layout of a text string. The text content can
+ * either be a plain string (the simple/legacy path) or a list of inline
+ * segments produced by `inline.ts` — segments enable mixed colors, fonts,
+ * weights, etc. on a shared line via `<span>` and similar inline elements.
+ *
+ * Per-segment padding/border/background-color is paint-only: it does not
+ * influence layout. This is a deliberate determinism tradeoff over full
+ * HTML compatibility.
  */
 import type { LayoutContext } from '../layout.js'
 import {
@@ -16,12 +22,18 @@ import { getYoga, TYoga, YogaNode } from '../yoga.js'
 import buildText, { container } from '../builder/text.js'
 import { buildDropShadow } from '../builder/shadow.js'
 import buildDecoration from '../builder/text-decoration.js'
-import type { GlyphBox } from '../font.js'
+import type { FontEngine, GlyphBox } from '../font.js'
 import { Locale } from '../language.js'
 import { HorizontalEllipsis, Space, Tab } from './characters.js'
 import { genMeasurer } from './measurer.js'
 import { preprocess } from './processor.js'
 import cssColorParse from 'parse-css-color'
+import type { InlineSegment, InlineSpan } from './inline.js'
+import radius from '../builder/border-radius.js'
+
+export type TextContent =
+  | string
+  | { segments: InlineSegment[]; spans: InlineSpan[] }
 
 const skippedWordWhenFindingMissingFont = new Set([Tab])
 
@@ -44,10 +56,20 @@ function isOpaqueWhite(color: string): boolean {
 }
 
 export default async function* buildTextNodes(
-  content: string,
+  content: TextContent,
   context: LayoutContext
 ): AsyncGenerator<{ word: string; locale?: Locale }[], string, [any, any]> {
   const Yoga = await getYoga()
+  const inlineSegments: InlineSegment[] | null =
+    typeof content === 'string' ? null : content.segments
+  const inlineSpans: InlineSpan[] =
+    typeof content === 'string' ? [] : content.spans
+  // Concatenate segment text for the segment path. Word-level segment lookup
+  // will be tracked separately via `wordSegmentIndex`.
+  const rawContent: string =
+    typeof content === 'string'
+      ? content
+      : inlineSegments.map((s) => s.text).join('')
 
   const {
     parentStyle,
@@ -77,16 +99,107 @@ export default async function* buildTextNodes(
     flexShrink,
   } = parentStyle
 
-  const {
-    words,
-    requiredBreaks,
-    allowSoftWrap,
-    allowBreakWord,
-    processedContent,
-    shouldCollapseTabsAndSpaces,
-    lineLimit,
-    blockEllipsis,
-  } = preprocess(content, parentStyle, locale)
+  // Build the words / requiredBreaks list. For inline segments we run the
+  // preprocess on each segment in turn (using the segment's own white-space
+  // and word-break rules — though typically these are inherited and shared
+  // with the parent). The resulting word list is parallel to
+  // `wordSegmentIndex`, which records which inline segment each word came
+  // from. For the simple string path, every word belongs to segment 0.
+  let words: string[]
+  let requiredBreaks: boolean[]
+  let allowSoftWrap: boolean
+  let allowBreakWord: boolean
+  let processedContent: string
+  let shouldCollapseTabsAndSpaces: boolean
+  let lineLimit: number
+  let blockEllipsis: string | undefined
+  let wordSegmentIndex: number[] = []
+
+  if (inlineSegments) {
+    words = []
+    requiredBreaks = []
+    processedContent = ''
+    let firstPP: ReturnType<typeof preprocess> | null = null
+    // Whether the running concatenated word list ends with a whitespace
+    // character. Used to suppress redundant leading-space restoration when
+    // the previous segment already provided the inter-segment space.
+    let lastWordEndsWithSpace = false
+    for (let si = 0; si < inlineSegments.length; si++) {
+      const seg = inlineSegments[si]
+      const isFirst = si === 0
+      const isLast = si === inlineSegments.length - 1
+      const hadLeadingSpace = /^\s/.test(seg.text)
+      const hadTrailingSpace = /\s$/.test(seg.text)
+
+      const pp = preprocess(seg.text, seg.style, locale)
+      if (!firstPP) firstPP = pp
+
+      // The default `preprocess` strips leading/trailing whitespace. For
+      // inline segments we want to preserve whitespace at segment
+      // boundaries so the natural inter-word spacing of the original
+      // markup survives. We re-attach a single space to the adjacent
+      // word when the original segment had it and we're not at a global
+      // edge.
+      if (hadLeadingSpace && !isFirst && !lastWordEndsWithSpace) {
+        if (pp.words.length > 0) {
+          pp.words[0] = ' ' + pp.words[0]
+        } else {
+          pp.words.push(' ')
+          pp.requiredBreaks.push(false)
+        }
+      }
+      if (hadTrailingSpace && !isLast) {
+        if (pp.words.length > 0) {
+          if (!/\s$/.test(pp.words[pp.words.length - 1])) {
+            pp.words[pp.words.length - 1] += ' '
+          }
+        } else {
+          pp.words.push(' ')
+          pp.requiredBreaks.push(false)
+        }
+      }
+
+      // Append words. requiredBreaks has length words.length+1 (with a
+      // leading false). When concatenating, drop the leading false on
+      // every segment after the first so the global array stays aligned.
+      for (let wi = 0; wi < pp.words.length; wi++) {
+        words.push(pp.words[wi])
+        wordSegmentIndex.push(si)
+      }
+      if (requiredBreaks.length === 0) {
+        requiredBreaks.push(...pp.requiredBreaks)
+      } else {
+        for (let wi = 1; wi < pp.requiredBreaks.length; wi++) {
+          requiredBreaks.push(pp.requiredBreaks[wi])
+        }
+      }
+      processedContent += pp.processedContent
+      if (pp.words.length > 0) {
+        lastWordEndsWithSpace = /\s$/.test(pp.words[pp.words.length - 1])
+      }
+    }
+    // Use the first segment's preprocess result for shared flags. For the
+    // common case all spans inherit from the parent so these values are
+    // identical across segments.
+    allowSoftWrap = firstPP ? firstPP.allowSoftWrap : true
+    allowBreakWord = firstPP ? firstPP.allowBreakWord : false
+    shouldCollapseTabsAndSpaces = firstPP
+      ? firstPP.shouldCollapseTabsAndSpaces
+      : true
+    lineLimit = firstPP ? firstPP.lineLimit : Infinity
+    blockEllipsis = firstPP ? firstPP.blockEllipsis : undefined
+  } else {
+    const pp = preprocess(rawContent, parentStyle, locale)
+    words = pp.words
+    requiredBreaks = pp.requiredBreaks
+    allowSoftWrap = pp.allowSoftWrap
+    allowBreakWord = pp.allowBreakWord
+    processedContent = pp.processedContent
+    shouldCollapseTabsAndSpaces = pp.shouldCollapseTabsAndSpaces
+    lineLimit = pp.lineLimit
+    blockEllipsis = pp.blockEllipsis
+    for (let i = 0; i < words.length; i++) wordSegmentIndex.push(0)
+  }
 
   const textContainer = createTextContainerNode(Yoga, textAlign)
   parent.insertChild(textContainer, parent.getChildCount())
@@ -95,15 +208,55 @@ export default async function* buildTextNodes(
     parent.setFlexShrink(1)
   }
 
+  // Resolve a font engine for a given segment. For the string path there is
+  // a single engine. For the segment path we cache by style key so segments
+  // that share the same {fontFamily, fontWeight, fontStyle, fontSize} share
+  // an engine instance.
+  const engineCache = new Map<string, FontEngine>()
+  const segmentStyles: any[] = inlineSegments
+    ? inlineSegments.map((s) => s.style)
+    : [parentStyle]
+  function getEngineFor(segIndex: number): FontEngine {
+    const sStyle = segmentStyles[segIndex] || parentStyle
+    const key = `${sStyle.fontFamily}|${sStyle.fontWeight}|${sStyle.fontStyle}|${sStyle.fontSize}|${sStyle.lineHeight}`
+    let e = engineCache.get(key)
+    if (!e) {
+      e = font.getEngine(
+        sStyle.fontSize || fontSize,
+        sStyle.lineHeight || lineHeight,
+        sStyle,
+        locale
+      )
+      engineCache.set(key, e)
+    }
+    return e
+  }
+
   // Get the correct font according to the container style.
   // https://www.w3.org/TR/CSS2/visudet.html
   let engine = font.getEngine(fontSize, lineHeight, parentStyle, locale)
 
-  // Yield segments that are missing a font.
-  const wordsMissingFont = canLoadAdditionalAssets
-    ? segment(processedContent, 'grapheme').filter(
-        (word) => !shouldSkipWhenFindingMissingFont(word) && !engine.has(word)
-      )
+  // Yield segments that are missing a font. For the segment path we check
+  // each segment with its own engine so font fallback is correctly scoped.
+  const wordsMissingFont: string[] = canLoadAdditionalAssets
+    ? (() => {
+        if (inlineSegments) {
+          const out: string[] = []
+          for (let si = 0; si < inlineSegments.length; si++) {
+            const segText = inlineSegments[si].text
+            const segEngine = getEngineFor(si)
+            for (const w of segment(segText, 'grapheme')) {
+              if (!shouldSkipWhenFindingMissingFont(w) && !segEngine.has(w)) {
+                out.push(w)
+              }
+            }
+          }
+          return out
+        }
+        return segment(processedContent, 'grapheme').filter(
+          (word) => !shouldSkipWhenFindingMissingFont(word) && !engine.has(word)
+        )
+      })()
     : []
 
   yield wordsMissingFont.map((word) => {
@@ -114,8 +267,9 @@ export default async function* buildTextNodes(
   })
 
   if (wordsMissingFont.length) {
-    // Reload the engine with additional fonts.
+    // Reload the engine(s) with additional fonts.
     engine = font.getEngine(fontSize, lineHeight, parentStyle, locale)
+    engineCache.clear()
   }
 
   function isImage(s: string): boolean {
@@ -131,13 +285,43 @@ export default async function* buildTextNodes(
     }
   )
 
+  // Per-segment measurers for the inline-segment path. Each entry uses the
+  // segment's own engine + fontSize + letterSpacing so widths reflect the
+  // span's style. For the string path this map is unused.
+  type Measurer = ReturnType<typeof genMeasurer>
+  const measurerCache = new Map<number, Measurer>()
+  function getMeasurerFor(segIndex: number): Measurer {
+    let m = measurerCache.get(segIndex)
+    if (m) return m
+    if (!inlineSegments) {
+      measurerCache.set(segIndex, {
+        measureGrapheme,
+        measureGraphemeArray,
+        measureText,
+      })
+      return measurerCache.get(segIndex)!
+    }
+    const sStyle = segmentStyles[segIndex] || parentStyle
+    const segEngine = getEngineFor(segIndex)
+    m = genMeasurer(segEngine, isImage, {
+      fontSize: sStyle.fontSize || fontSize,
+      letterSpacing:
+        sStyle.letterSpacing !== undefined
+          ? sStyle.letterSpacing
+          : letterSpacing,
+    })
+    measurerCache.set(segIndex, m)
+    return m
+  }
+
   const tabWidth = isString(tabSize)
     ? lengthToNumber(tabSize, fontSize, 1, parentStyle)
     : measureGrapheme(Space) * tabSize
 
   const calc = (
     text: string,
-    currentWidth: number
+    currentWidth: number,
+    segIndex = 0
   ): {
     originWidth: number
     endingSpacesWidth: number
@@ -151,6 +335,10 @@ export default async function* buildTextNodes(
       }
     }
 
+    const { measureText: m } = inlineSegments
+      ? getMeasurerFor(segIndex)
+      : { measureText }
+
     const { index, tabCount } = detectTabs(text)
 
     let originWidth = 0
@@ -158,19 +346,19 @@ export default async function* buildTextNodes(
     if (tabCount > 0) {
       const textBeforeTab = text.slice(0, index)
       const textAfterTab = text.slice(index + tabCount)
-      const textWidthBeforeTab = measureText(textBeforeTab)
+      const textWidthBeforeTab = m(textBeforeTab)
       const offsetBeforeTab = textWidthBeforeTab + currentWidth
       const tabMoveDistance =
         tabWidth === 0
           ? textWidthBeforeTab
           : (Math.floor(offsetBeforeTab / tabWidth) + tabCount) * tabWidth
-      originWidth = tabMoveDistance + measureText(textAfterTab)
+      originWidth = tabMoveDistance + m(textAfterTab)
     } else {
-      originWidth = measureText(text)
+      originWidth = m(text)
     }
 
     const afterTrimEndWidth =
-      text.trimEnd() === text ? originWidth : measureText(text.trimEnd())
+      text.trimEnd() === text ? originWidth : m(text.trimEnd())
 
     return {
       originWidth,
@@ -185,6 +373,10 @@ export default async function* buildTextNodes(
   let baselines = []
   let lineSegmentNumber = []
   let texts: string[] = []
+  // Per-emitted-text segment index. Mirrors `texts[]` and
+  // `wordPositionInLayout[]` length-wise so the emission loop can look up
+  // each piece's owning inline segment.
+  let textSegments: number[] = []
   let wordPositionInLayout: (null | {
     x: number
     y: number
@@ -207,6 +399,7 @@ export default async function* buildTextNodes(
     lineWidths = []
     lineSegmentNumber = [0]
     texts = []
+    textSegments = []
     wordPositionInLayout = []
 
     // We naively implement the width calculation without proper kerning.
@@ -217,6 +410,11 @@ export default async function* buildTextNodes(
     while (i < words.length && lines < lineLimit) {
       let word = words[i]
       const forceBreak = requiredBreaks[i]
+      const segIdx = wordSegmentIndex[i] ?? 0
+      const wordEngine = inlineSegments ? getEngineFor(segIdx) : engine
+      const wordMeasurer = inlineSegments
+        ? getMeasurerFor(segIdx)
+        : { measureGrapheme, measureText }
 
       let w = 0
 
@@ -224,7 +422,7 @@ export default async function* buildTextNodes(
         originWidth,
         endingSpacesWidth,
         text: _word,
-      } = calc(word, currentWidth)
+      } = calc(word, currentWidth, segIdx)
       word = _word
 
       w = originWidth
@@ -233,7 +431,7 @@ export default async function* buildTextNodes(
       // When starting a new line from an empty line, we should push one extra
       // line height.
       if (forceBreak && currentLineHeight === 0) {
-        currentLineHeight = engine.height(word)
+        currentLineHeight = wordEngine.height(word)
       }
 
       const allowedToJustify = textAlign === 'justify'
@@ -262,6 +460,9 @@ export default async function* buildTextNodes(
         // Break the word into multiple segments and continue the loop.
         const chars = segment(word, 'grapheme')
         words.splice(i, 1, ...chars)
+        // Replicate the segment-index entry so each new char keeps its
+        // owning inline segment.
+        wordSegmentIndex.splice(i, 1, ...new Array(chars.length).fill(segIdx))
         if (currentWidth > 0) {
           // Start a new line, spaces can be ignored.
           lineWidths.push(currentWidth - prevLineEndingSpacesWidth)
@@ -288,8 +489,8 @@ export default async function* buildTextNodes(
         lines++
         height += currentLineHeight
         currentWidth = w
-        currentLineHeight = w ? Math.round(engine.height(word)) : 0
-        currentBaselineOffset = w ? Math.round(engine.baseline(word)) : 0
+        currentLineHeight = w ? Math.round(wordEngine.height(word)) : 0
+        currentBaselineOffset = w ? Math.round(wordEngine.baseline(word)) : 0
         lineSegmentNumber.push(1)
         lineIndex = -1
 
@@ -302,11 +503,11 @@ export default async function* buildTextNodes(
       } else {
         // It fits into the current line.
         currentWidth += w
-        const glyphHeight = Math.round(engine.height(word))
+        const glyphHeight = Math.round(wordEngine.height(word))
         if (glyphHeight > currentLineHeight) {
           // Use the baseline of the highest segment as the baseline of the line.
           currentLineHeight = glyphHeight
-          currentBaselineOffset = Math.round(engine.baseline(word))
+          currentBaselineOffset = Math.round(wordEngine.baseline(word))
         }
         if (allowedToJustify) {
           lineSegmentNumber[lineSegmentNumber.length - 1]++
@@ -332,6 +533,9 @@ export default async function* buildTextNodes(
         })
       } else {
         const _texts = segment(word, 'word')
+        const segFontSize = inlineSegments
+          ? segmentStyles[segIdx]?.fontSize ?? fontSize
+          : fontSize
 
         for (let j = 0; j < _texts.length; j++) {
           const _text = _texts[j]
@@ -339,19 +543,20 @@ export default async function* buildTextNodes(
           let _isImage = false
 
           if (isImage(_text)) {
-            _width = fontSize
+            _width = segFontSize
             _isImage = true
           } else if (!embedFont && _text.length > 1) {
             // When embedFont is false, use measureText for multi-character strings
             // to ensure consistency with how currentWidth is accumulated (sum of
             // grapheme widths). measureGrapheme uses getAdvanceWidth which includes
             // kerning, causing position mismatches between consecutive <text> elements.
-            _width = measureText(_text)
+            _width = wordMeasurer.measureText(_text)
           } else {
-            _width = measureGrapheme(_text)
+            _width = wordMeasurer.measureGrapheme(_text)
           }
 
           texts.push(_text)
+          textSegments.push(segIdx)
           wordPositionInLayout.push({
             y: height,
             x,
@@ -456,6 +661,11 @@ export default async function* buildTextNodes(
   const [x, y] = yield
 
   let result = ''
+  // Per-word `<text>` emissions accumulate here when embedFont is false.
+  // They are kept separate from `result` so the span paint pass (bg/border
+  // rects) can be inserted BEFORE them in document order — otherwise the
+  // rects paint on top of the text in the !embedFont path.
+  let textEmissions = ''
   let backgroundClipDef = ''
 
   const clipPathId = inheritedStyle._inheritedClipPathId as string | undefined
@@ -539,6 +749,73 @@ export default async function* buildTextNodes(
   let decorationGlyphs: Record<number, GlyphBox[]> = {}
   let wordBuffer: string | null = null
   let bufferedOffset = 0
+  let bufferedSegIdx = 0
+
+  // Path fragments grouped by style key so paths with different fill/stroke
+  // emit as separate <path> elements. For the string path there is one
+  // fragment with parent style. For inline segments we add one fragment
+  // per distinct color/stroke combination.
+  type PathFragment = { style: any; path: string }
+  const pathFragments = new Map<string, PathFragment>()
+  const styleKey = (s: any) =>
+    `${s.color || ''}|${s.WebkitTextStrokeWidth || ''}|${
+      s.WebkitTextStrokeColor || ''
+    }`
+  const appendPath = (segIdx: number, p: string) => {
+    const sStyle = (inlineSegments && segmentStyles[segIdx]) || parentStyle
+    const k = styleKey(sStyle)
+    let entry = pathFragments.get(k)
+    if (!entry) {
+      entry = { style: sStyle, path: '' }
+      pathFragments.set(k, entry)
+    }
+    entry.path += p + ' '
+    // Keep mergedPath for background-clip: text and the "any path was
+    // produced" check. It contains every segment's path concatenated.
+    mergedPath += p + ' '
+  }
+  // Per-line-and-span word position tracking, used by the span paint pass to
+  // emit per-line bg/border rects.
+  type SpanWordEntry = {
+    line: number
+    leftOffset: number
+    rightOffset: number
+    topOffset: number
+    height: number
+    baselineDelta: number
+    baselineOfWord: number
+  }
+  const spanWordEntries: Map<string, SpanWordEntry[]> = new Map()
+  const recordSpanWord = (
+    segIdx: number,
+    leftOffset: number,
+    rightOffset: number,
+    topOffset: number,
+    heightOfWord: number,
+    baselineDelta: number,
+    baselineOfWord: number,
+    line: number
+  ) => {
+    if (!inlineSegments) return
+    const seg = inlineSegments[segIdx]
+    if (!seg) return
+    for (const span of seg.spans) {
+      let arr = spanWordEntries.get(span.id)
+      if (!arr) {
+        arr = []
+        spanWordEntries.set(span.id, arr)
+      }
+      arr.push({
+        line,
+        leftOffset,
+        rightOffset,
+        topOffset,
+        height: heightOfWord,
+        baselineDelta,
+        baselineOfWord,
+      })
+    }
+  }
 
   for (let i = 0; i < texts.length; i++) {
     // Skip whitespace and empty characters.
@@ -548,12 +825,25 @@ export default async function* buildTextNodes(
     if (!layout) continue
 
     let text = texts[i]
+    const wordSegIdx = textSegments[i] ?? 0
+    const wordSegStyle =
+      (inlineSegments && segmentStyles[wordSegIdx]) || parentStyle
+    const wordEngineEmit = inlineSegments ? getEngineFor(wordSegIdx) : engine
+    const wordFontSize = inlineSegments
+      ? wordSegStyle.fontSize ?? fontSize
+      : fontSize
+    const wordLetterSpacing = inlineSegments
+      ? wordSegStyle.letterSpacing !== undefined
+        ? wordSegStyle.letterSpacing
+        : letterSpacing
+      : letterSpacing
     let path: string | null = null
     let isLastDisplayedBeforeEllipsis = false
 
     const image = graphemeImages ? graphemeImages[text] : null
 
     let topOffset = layout.y
+    const lineTopOffset = layout.y
     let leftOffset = layout.x
     const width = layout.width
     const line = layout.line
@@ -600,8 +890,8 @@ export default async function* buildTextNodes(
     }
 
     const baselineOfLine = baselines[line]
-    const baselineOfWord = engine.baseline(text)
-    const heightOfWord = engine.height(text)
+    const baselineOfWord = wordEngineEmit.baseline(text)
+    const heightOfWord = wordEngineEmit.height(text)
     const baselineDelta = baselineOfLine - baselineOfWord
 
     const buildUnderlineBand = (offset: number) => {
@@ -614,7 +904,7 @@ export default async function* buildTextNodes(
       const baseline = top + offset + baselineDelta + baselineOfWord
       return {
         underlineY: baseline + baselineOfWord * 0.1,
-        strokeWidth: Math.max(1, fontSize * 0.1),
+        strokeWidth: Math.max(1, wordFontSize * 0.1),
       }
     }
 
@@ -714,12 +1004,33 @@ export default async function* buildTextNodes(
       }
     }
 
+    // Record this word's geometry for the span paint pass. This must run
+    // BEFORE the embedFont kerning-buffer branch — otherwise words that get
+    // merged into a buffer hit `continue` and never get recorded, which
+    // causes the span's per-line bg rect to only cover the last word of
+    // each kerning run instead of the full span.
+    recordSpanWord(
+      wordSegIdx,
+      leftOffset,
+      leftOffset + width,
+      lineTopOffset,
+      heightOfWord,
+      baselineDelta,
+      baselineOfWord,
+      line
+    )
+
     if (image) {
       // For images, we remove the baseline offset.
       topOffset += 0
     } else if (embedFont) {
-      // If the current word and the next word are on the same line, we try to
-      // merge them together to better handle the kerning.
+      // If the current word and the next word are on the same line AND share
+      // the same inline segment style, we try to merge them together to
+      // better handle the kerning. When the next word belongs to a different
+      // segment we must flush the buffer so each style emits its own path
+      // with the correct color/font.
+      const nextSegIdx = textSegments[i + 1] ?? 0
+      const sameSegmentAsNext = nextSegIdx === wordSegIdx
       if (
         !text.includes(Tab) &&
         !wordSeparators.includes(text) &&
@@ -727,10 +1038,12 @@ export default async function* buildTextNodes(
         nextLayout &&
         !nextLayout.isImage &&
         topOffset === nextLayout.y &&
-        !isLastDisplayedBeforeEllipsis
+        !isLastDisplayedBeforeEllipsis &&
+        sameSegmentAsNext
       ) {
         if (wordBuffer === null) {
           bufferedOffset = leftOffset
+          bufferedSegIdx = wordSegIdx
         }
         wordBuffer = wordBuffer === null ? text : wordBuffer + text
         continue
@@ -743,14 +1056,14 @@ export default async function* buildTextNodes(
 
       const band = buildUnderlineBand(topOffset)
 
-      const svg = engine.getSVG(
+      const svg = wordEngineEmit.getSVG(
         finalizedSegment.replace(/(\t)+/g, ''),
         {
-          fontSize,
+          fontSize: wordFontSize,
           left: left + finalizedLeftOffset,
           // Since we need to pass the baseline position, add the ascender to the top.
           top: top + topOffset + baselineOfWord + baselineDelta,
-          letterSpacing,
+          letterSpacing: wordLetterSpacing,
         },
         band
       )
@@ -800,13 +1113,13 @@ export default async function* buildTextNodes(
       if (shouldCollectDecorationBoxes && !image) {
         const band = buildUnderlineBand(topOffset)
 
-        const svg = engine.getSVG(
+        const svg = wordEngineEmit.getSVG(
           text.replace(/(\t)+/g, ''),
           {
-            fontSize,
+            fontSize: wordFontSize,
             left: left + leftOffset,
             top: top + topOffset,
-            letterSpacing,
+            letterSpacing: wordLetterSpacing,
           },
           band
         )
@@ -820,7 +1133,12 @@ export default async function* buildTextNodes(
     }
 
     if (path !== null) {
-      mergedPath += path + ' '
+      // Group by segment style so paths with different colors render as
+      // separate <path> elements at the end. The segment index here is the
+      // buffered segment for this flush (set when the buffer started) or
+      // this word's segment if there was no buffer.
+      const flushSegIdx = wordBuffer === null ? wordSegIdx : bufferedSegIdx
+      appendPath(flushSegIdx, path)
     } else {
       const [t, shape] = buildText(
         {
@@ -838,9 +1156,11 @@ export default async function* buildTextNodes(
           debug,
           shape: !!_inheritedBackgroundClipTextPath,
         },
-        parentStyle
+        // Use the segment's own style when rendering as <text> so font and
+        // color attributes match the inline span.
+        wordSegStyle
       )
-      result += t
+      textEmissions += t
       backgroundClipDef += shape
     }
 
@@ -871,40 +1191,153 @@ export default async function* buildTextNodes(
       .join('')
   }
 
-  // Embed the font as path.
-  if (mergedPath) {
-    const p =
-      (!isFullyTransparent(parentStyle.color) || filter) && opacity !== 0
-        ? `<g ${overflowMaskId ? `mask="url(#${overflowMaskId})"` : ''} ${
-            clipPathId ? `clip-path="url(#${clipPathId})"` : ''
-          }>` +
-          buildXMLString('path', {
-            fill:
-              filter &&
-              (isFullyTransparent(parentStyle.color) ||
-                (_inheritedBackgroundClipTextHasBackground &&
-                  isOpaqueWhite(parentStyle.color)))
-                ? 'black'
-                : parentStyle.color,
-            d: mergedPath,
+  // Span paint pass: emit per-line bg/border rects for each inline span.
+  // Padding inflates the rect outwards (visual only — does not affect
+  // layout). Border draws on the inflated rect's edges.
+  let spanPaint = ''
+  if (inlineSegments && inlineSpans.length > 0) {
+    for (const span of inlineSpans) {
+      const entries = spanWordEntries.get(span.id)
+      if (!entries || entries.length === 0) continue
+      const sStyle: any = span.style
+      const hasBg =
+        sStyle.backgroundColor &&
+        sStyle.backgroundColor !== 'transparent' &&
+        !isFullyTransparent(sStyle.backgroundColor)
+      const borderTopWidth = sStyle.borderTopWidth || 0
+      const borderRightWidth = sStyle.borderRightWidth || 0
+      const borderBottomWidth = sStyle.borderBottomWidth || 0
+      const borderLeftWidth = sStyle.borderLeftWidth || 0
+      const hasBorder =
+        borderTopWidth ||
+        borderRightWidth ||
+        borderBottomWidth ||
+        borderLeftWidth
+      if (!hasBg && !hasBorder) continue
+
+      const padTop = sStyle.paddingTop || 0
+      const padRight = sStyle.paddingRight || 0
+      const padBottom = sStyle.paddingBottom || 0
+      const padLeft = sStyle.paddingLeft || 0
+
+      // Group entries by line.
+      const byLine: Record<number, SpanWordEntry[]> = {}
+      for (const entry of entries) {
+        ;(byLine[entry.line] || (byLine[entry.line] = [])).push(entry)
+      }
+
+      for (const lineKey in byLine) {
+        const lineEntries = byLine[lineKey]
+        let minLeft = Infinity
+        let maxRight = -Infinity
+        let lineTop = Infinity
+        let maxHeight = 0
+        for (const e of lineEntries) {
+          if (e.leftOffset < minLeft) minLeft = e.leftOffset
+          if (e.rightOffset > maxRight) maxRight = e.rightOffset
+          if (e.topOffset < lineTop) lineTop = e.topOffset
+          if (e.height > maxHeight) maxHeight = e.height
+        }
+        const rectLeft = left + minLeft - padLeft
+        const rectTop = top + lineTop - padTop
+        const rectWidth = maxRight - minLeft + padLeft + padRight
+        const rectHeight = maxHeight + padTop + padBottom
+
+        const rPath = radius(
+          {
+            left: rectLeft,
+            top: rectTop,
+            width: rectWidth,
+            height: rectHeight,
+          },
+          sStyle as Record<string, number>
+        )
+
+        if (hasBg) {
+          spanPaint += buildXMLString(rPath ? 'path' : 'rect', {
+            x: rPath ? undefined : rectLeft,
+            y: rPath ? undefined : rectTop,
+            width: rPath ? undefined : rectWidth,
+            height: rPath ? undefined : rectHeight,
+            d: rPath || undefined,
+            fill: sStyle.backgroundColor,
             transform: matrix ? matrix : undefined,
-            opacity: opacity !== 1 ? opacity : undefined,
-            style: cssFilter ? `filter:${cssFilter}` : undefined,
-            'stroke-width': inheritedStyle.WebkitTextStrokeWidth
-              ? `${inheritedStyle.WebkitTextStrokeWidth}px`
-              : undefined,
-            stroke: inheritedStyle.WebkitTextStrokeWidth
-              ? inheritedStyle.WebkitTextStrokeColor
-              : undefined,
-            'stroke-linejoin': inheritedStyle.WebkitTextStrokeWidth
-              ? 'round'
-              : undefined,
-            'paint-order': inheritedStyle.WebkitTextStrokeWidth
-              ? 'stroke'
-              : undefined,
-          }) +
-          '</g>'
-        : ''
+            'clip-path': clipPathId ? `url(#${clipPathId})` : undefined,
+          })
+        }
+
+        if (hasBorder) {
+          // Inline span borders are rendered as a single stroked rect.
+          // Per-side widths/colors are intentionally collapsed to the top
+          // border's values for determinism and simplicity — see the inline
+          // tradeoff noted in this module's header comment.
+          const strokeColor = sStyle.borderTopColor || sStyle.color
+          const strokeWidth =
+            borderTopWidth ||
+            borderRightWidth ||
+            borderBottomWidth ||
+            borderLeftWidth
+          spanPaint += buildXMLString(rPath ? 'path' : 'rect', {
+            x: rPath ? undefined : rectLeft,
+            y: rPath ? undefined : rectTop,
+            width: rPath ? undefined : rectWidth,
+            height: rPath ? undefined : rectHeight,
+            d: rPath || undefined,
+            fill: 'none',
+            stroke: strokeColor,
+            'stroke-width': strokeWidth,
+            transform: matrix ? matrix : undefined,
+            'clip-path': clipPathId ? `url(#${clipPathId})` : undefined,
+          })
+        }
+      }
+    }
+  }
+
+  // Emit the path fragments. For the string path there is exactly one
+  // fragment using parent style; for the segment path there is one fragment
+  // per distinct color/stroke combination.
+  let pathsMarkup = ''
+  if (mergedPath) {
+    const fragments =
+      pathFragments.size > 0
+        ? Array.from(pathFragments.values())
+        : [{ style: parentStyle, path: mergedPath }]
+
+    for (const frag of fragments) {
+      const fStyle: any = frag.style
+      const fColor = fStyle.color
+      const fStrokeWidth =
+        fStyle.WebkitTextStrokeWidth || inheritedStyle.WebkitTextStrokeWidth
+      const fStrokeColor =
+        fStyle.WebkitTextStrokeColor || inheritedStyle.WebkitTextStrokeColor
+
+      const p =
+        (!isFullyTransparent(fColor) || filter) && opacity !== 0
+          ? `<g ${overflowMaskId ? `mask="url(#${overflowMaskId})"` : ''} ${
+              clipPathId ? `clip-path="url(#${clipPathId})"` : ''
+            }>` +
+            buildXMLString('path', {
+              fill:
+                filter &&
+                (isFullyTransparent(fColor) ||
+                  (_inheritedBackgroundClipTextHasBackground &&
+                    isOpaqueWhite(fColor)))
+                  ? 'black'
+                  : fColor,
+              d: frag.path,
+              transform: matrix ? matrix : undefined,
+              opacity: opacity !== 1 ? opacity : undefined,
+              style: cssFilter ? `filter:${cssFilter}` : undefined,
+              'stroke-width': fStrokeWidth ? `${fStrokeWidth}px` : undefined,
+              stroke: fStrokeWidth ? fStrokeColor : undefined,
+              'stroke-linejoin': fStrokeWidth ? 'round' : undefined,
+              'paint-order': fStrokeWidth ? 'stroke' : undefined,
+            }) +
+            '</g>'
+          : ''
+      pathsMarkup += p
+    }
 
     if (_inheritedBackgroundClipTextPath) {
       backgroundClipDef = buildXMLString('path', {
@@ -913,19 +1346,38 @@ export default async function* buildTextNodes(
       })
     }
 
-    result +=
+    // Prepend spanPaint so bg/border rects render UNDER the text paths.
+    // textEmissions is empty in the embedFont path (paths go through
+    // pathFragments instead), but we include it here for completeness.
+    result =
+      spanPaint +
+      textEmissions +
+      result +
       (filter
         ? filter +
           buildXMLString(
             'g',
             { filter: `url(#satori_s-${id})` },
-            p + decorationShape
+            pathsMarkup + decorationShape
           )
-        : p + decorationShape) + extra
+        : pathsMarkup + decorationShape) +
+      extra
   } else if (decorationShape) {
-    result += filter
-      ? buildXMLString('g', { filter: `url(#satori_s-${id})` }, decorationShape)
-      : decorationShape
+    result =
+      spanPaint +
+      textEmissions +
+      result +
+      (filter
+        ? buildXMLString(
+            'g',
+            { filter: `url(#satori_s-${id})` },
+            decorationShape
+          )
+        : decorationShape)
+  } else {
+    // No font paths and no decoration — emit span bg/border rects first
+    // so they sit under any !embedFont <text> emissions.
+    result = spanPaint + textEmissions + result
   }
 
   // Attach information to the parent node.

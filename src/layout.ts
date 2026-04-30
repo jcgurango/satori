@@ -17,6 +17,12 @@ import { SVGNodeToImage } from './handler/preprocess.js'
 import computeStyle from './handler/compute.js'
 import FontLoader from './font.js'
 import buildTextNodes from './text/index.js'
+import {
+  flattenInline,
+  shouldUseInlinePath,
+  InlineSegment,
+  InlineSpan,
+} from './text/inline.js'
 import rect from './builder/rect.js'
 import { Locale, normalizeLocale } from './language.js'
 import { SerializedStyle } from './handler/expand.js'
@@ -184,33 +190,84 @@ export default async function* layout(
   const normalizedChildren = normalizeChildren(children)
   const iterators: ReturnType<typeof layout>[] = []
 
+  // Detect the inline path: if all children are text strings or recognized
+  // inline elements (span, b, strong, ...), and at least one is an inline
+  // element, we flatten the subtree into a list of segments and feed them
+  // into a single buildTextNodes call. Inline elements do NOT get their
+  // own Yoga node — their text contributes to the parent's text flow.
+  let inlineIter: ReturnType<typeof buildTextNodes> | null = null
+  const useInline =
+    normalizedChildren.length > 0 && shouldUseInlinePath(normalizedChildren)
+
   let i = 0
   const segmentsMissingFont: { word: string; locale?: string }[] = []
-  for (const child of normalizedChildren) {
-    const iter = layout(child, {
-      id: id + '-' + i++,
-      parentStyle: computedStyle,
-      inheritedStyle: newInheritableStyle,
-      isInheritingTransform: true,
-      parent: node,
-      font,
-      embedFont,
-      debug,
-      graphemeImages,
-      canLoadAdditionalAssets,
-      locale: newLocale,
-      getTwStyles,
-      onNodeDetected: context.onNodeDetected,
-    })
+
+  if (useInline) {
+    const segments: InlineSegment[] = []
+    const spans: InlineSpan[] = []
+    await flattenInline(
+      normalizedChildren,
+      newInheritableStyle,
+      [],
+      segments,
+      spans
+    )
+    inlineIter = buildTextNodes(
+      { segments, spans },
+      {
+        id: id + '-inline',
+        parentStyle: computedStyle,
+        inheritedStyle: newInheritableStyle,
+        isInheritingTransform: true,
+        parent: node,
+        font,
+        embedFont,
+        debug,
+        graphemeImages,
+        canLoadAdditionalAssets,
+        locale: newLocale,
+        getTwStyles,
+        onNodeDetected: context.onNodeDetected,
+      }
+    )
     if (canLoadAdditionalAssets) {
-      segmentsMissingFont.push(...(((await iter.next()).value as any) || []))
+      segmentsMissingFont.push(
+        ...(((await inlineIter.next()).value as any) || [])
+      )
     } else {
-      await iter.next()
+      await inlineIter.next()
     }
-    iterators.push(iter)
+  } else {
+    for (const child of normalizedChildren) {
+      const iter = layout(child, {
+        id: id + '-' + i++,
+        parentStyle: computedStyle,
+        inheritedStyle: newInheritableStyle,
+        isInheritingTransform: true,
+        parent: node,
+        font,
+        embedFont,
+        debug,
+        graphemeImages,
+        canLoadAdditionalAssets,
+        locale: newLocale,
+        getTwStyles,
+        onNodeDetected: context.onNodeDetected,
+      })
+      if (canLoadAdditionalAssets) {
+        segmentsMissingFont.push(...(((await iter.next()).value as any) || []))
+      } else {
+        await iter.next()
+      }
+      iterators.push(iter)
+    }
   }
   yield segmentsMissingFont
-  for (const iter of iterators) await iter.next()
+  if (inlineIter) {
+    await inlineIter.next()
+  } else {
+    for (const iter of iterators) await iter.next()
+  }
 
   // 3. Post-process the node.
   const [x, y] = yield
@@ -282,7 +339,8 @@ export default async function* layout(
       typeof children !== 'string' &&
       display !== 'flex' &&
       display !== 'none' &&
-      display !== 'contents'
+      display !== 'contents' &&
+      !useInline
     ) {
       throw new Error(
         `Expected <div> to have explicit "display: flex", "display: contents", or "display: none" if it has more than one child node.`
@@ -296,8 +354,12 @@ export default async function* layout(
   }
 
   // Generate the rendered markup for the children.
-  for (const iter of iterators) {
-    childrenRenderResult += (await iter.next([left, top])).value
+  if (inlineIter) {
+    childrenRenderResult += (await inlineIter.next([left, top])).value
+  } else {
+    for (const iter of iterators) {
+      childrenRenderResult += (await iter.next([left, top])).value
+    }
   }
 
   // An extra pass to generate the special background-clip shape collected from
